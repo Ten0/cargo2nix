@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-cargo = "0.73.1"
+cargo_metadata = "0.18.1"
 cargo-platform = "0.1.4"
 clap = { version = "4.4.6", features = ["derive"] }
 clap_complete = { version = "4.4.3" }

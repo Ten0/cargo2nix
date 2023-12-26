@@ -7,31 +7,17 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{anyhow, Context, Result};
-use cargo::{
-    core::{
-        compiler::{CompileKind, RustcTargetData},
-        dependency::DepKind,
-        registry::PackageRegistry,
-        resolver::{
-            features::{ForceAllTargets, HasDevUnits},
-            CliFeatures, Resolve,
-        },
-        Package, PackageId, PackageIdSpec, Workspace,
-    },
-    ops::{resolve_with_previous, resolve_ws_with_opts, Packages},
-    util::important_paths::find_root_manifest_for_wd,
+use {
+    anyhow::{anyhow, Context, Result},
+    clap::{Command, CommandFactory, Parser, ValueHint},
+    clap_complete::{generate, Generator, Shell},
+    colorify::colorify,
+    semver::{Version, VersionReq},
+    sha2::{Digest, Sha256},
+    tera::Tera,
 };
-use cargo_platform::Platform;
-use clap::{Command, CommandFactory, Parser, ValueHint};
-use clap_complete::{generate, Generator, Shell};
-use colorify::colorify;
-use semver::{Version, VersionReq};
-use sha2::{Digest, Sha256};
-use tera::Tera;
 
-use crate::expr::BoolExpr;
-use crate::template::BuildPlan;
+use crate::{expr::BoolExpr, template::BuildPlan};
 
 mod expr;
 mod manifest;
@@ -199,6 +185,99 @@ fn write_to_stdout(rendered: &str) -> Result<()> {
 }
 
 fn generate_cargo_nix(workspace_directory: &PathBuf, locked: bool) -> Result<String> {
+    let mut root_manifest_path = workspace_directory.join("Cargo.toml");
+
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(&root_manifest_path)
+        .exec()
+        .context("Error running cargo metadata")?;
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .context("`resolve` not found - should not happen because we didn't call with --no-deps")?;
+    if metadata.workspace_root.as_path() != workspace_directory {
+        // In case the caller is running that targeting a subproject instead of the workspace,
+        // because metadata resolves the entire workspace
+        root_manifest_path = metadata.workspace_root.as_std_path().join("Cargo.toml");
+    }
+
+    let mut targets_by_id_and_name: HashMap<
+        (&cargo_metadata::PackageId, &str),
+        (&cargo_metadata::Package, &cargo_metadata::Target),
+    > = HashMap::new();
+    for pkg in metadata.packages.iter() {
+        for target in pkg.targets.iter() {
+            if targets_by_id_and_name
+                .insert((&pkg.id, target.name.as_str()), (pkg, target))
+                .is_some()
+            {
+                return Err(anyhow!(
+                    "Duplicate target {} in package {}",
+                    target.name,
+                    pkg.id
+                ));
+            }
+        }
+    }
+    let get_target = |id: &cargo_metadata::PackageId,
+                      name: &str|
+     -> anyhow::Result<(&cargo_metadata::Package, &cargo_metadata::Target)> {
+        targets_by_id_and_name
+            .get(&(id, name))
+            .copied()
+            .ok_or_else(|| anyhow!("Lost target"))
+    };
+    let packages_by_id: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Package> =
+        metadata.packages.iter().map(|pkg| (&pkg.id, pkg)).collect();
+    let get_package = |id: &cargo_metadata::PackageId| -> anyhow::Result<&cargo_metadata::Package> {
+        packages_by_id
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow!("Lost package"))
+    };
+
+    let package_resolve_nodes_by_id: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Node> =
+        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+
+    let resolved_packages: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Package> = resolve
+        .nodes
+        .iter()
+        .map(|package_resolve_node| {
+            let pkg = get_package(&package_resolve_node.id)?;
+            let dependencies_by_name = pkg
+                .dependencies
+                .iter()
+                .map(|dep| (dep.name.as_str(), dep))
+                .collect::<HashMap<_, _>>();
+            Ok(ResolvedPackage {
+                pkg,
+                deps: package_resolve_node
+                    .deps
+                    .iter()
+                    .zip(&pkg.dependencies)
+                    .flat_map(|(node_dep, dep)| {
+                        if dep.name.chars().all(|c| c.is_ascii_lowercase()) {
+                            anyhow::ensure!(
+                                node_dep.name == dep.name,
+                                "We have no way to match deps with dep nodes for external name on {}",
+                                pkg.id
+                            );
+                        }
+                        let dep_pkg = get_package(&node_dep.pkg)?;
+                        Ok(node_dep.dep_kinds.iter().map(|dep_kind|ResolvedDependency{
+                            extern_name: &dep.name,
+                            pkg: dep_pkg,
+                            optionality: Optionality::Required, /* TODO */
+                            dep_kind,
+                        }))
+                    })
+                    .collect(),
+                features: todo!(),
+                checksum: todo!(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
     let config = {
         let mut config = cargo::Config::default()?;
         config.configure(0, false, None, false, locked, false, &None, &[], &[])?;
@@ -353,8 +432,7 @@ fn simplify_optionality<'a, 'b: 'a>(rpkgs: impl IntoIterator<Item = &'a mut Reso
 }
 
 fn is_proc_macro(pkg: &Package) -> bool {
-    use cargo::core::compiler::CrateType;
-    use cargo::core::TargetKind;
+    use cargo::core::{compiler::CrateType, TargetKind};
     pkg.targets()
         .iter()
         .filter_map(|t| match t.kind() {
@@ -553,17 +631,17 @@ impl<'a> ResolvedPackage<'a> {
 
 #[derive(Debug)]
 struct ResolvedDependency<'a> {
-    extern_name: String,
-    pkg: &'a Package,
+    extern_name: &'a str,
+    pkg: &'a cargo_metadata::Package,
     optionality: Optionality<'a>,
-    platforms: Option<BTreeSet<&'a Platform>>,
+    dep_kind: &'a cargo_metadata::DepKindInfo,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 enum Optionality<'a> {
     Required,
     Optional {
-        activated_by_features: BTreeSet<RootFeature<'a>>,
+        activated_by_features: HashSet<RootFeature<'a>>,
     },
 }
 
