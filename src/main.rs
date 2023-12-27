@@ -201,6 +201,7 @@ fn generate_cargo_nix(workspace_directory: &PathBuf, locked: bool) -> Result<Str
         root_manifest_path = metadata.workspace_root.as_std_path().join("Cargo.toml");
     }
 
+    // Setup ability to lookup packages/targets by id/name
     let mut targets_by_id_and_name: HashMap<
         (&cargo_metadata::PackageId, &str),
         (&cargo_metadata::Package, &cargo_metadata::Target),
@@ -239,40 +240,95 @@ fn generate_cargo_nix(workspace_directory: &PathBuf, locked: bool) -> Result<Str
     let package_resolve_nodes_by_id: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Node> =
         resolve.nodes.iter().map(|node| (&node.id, node)).collect();
 
+    // Construct ResolvedPackage, which represents a Package with all additional information
+    // needed to generate the corresponding nix expression
     let resolved_packages: HashMap<&cargo_metadata::PackageId, &cargo_metadata::Package> = resolve
         .nodes
         .iter()
         .map(|package_resolve_node| {
             let pkg = get_package(&package_resolve_node.id)?;
-            let dependencies_by_name = pkg
+            // Establish ability to lookup dependencies from the crate name, so that when reading
+            // the dependency graph (that only contains the crate name) we can lookup the
+            // dependency's activation features
+            let crate_ified_dep_names = pkg
                 .dependencies
                 .iter()
-                .map(|dep| (dep.name.as_str(), dep))
-                .collect::<HashMap<_, _>>();
+                .map(|dep| {
+                    // Yes that is litterally all there is to it
+                    // https://docs.rs/cargo/0.75.1/src/cargo/core/manifest.rs.html#793-795
+                    dep.rename.as_deref().unwrap_or(&dep.name).replace("-", "_")
+                })
+                .collect::<Vec<_>>();
+            let dependencies_by_crate_name_and_kind: HashMap<
+                (&str, cargo_metadata::DependencyKind),
+                &cargo_metadata::Dependency,
+            > = HashMap::new();
+            for (dep, dep_crate_name) in pkg.dependencies.iter().zip(&crate_ified_dep_names) {
+                if dependencies_by_crate_name_and_kind
+                    .insert((dep_crate_name.as_str(), dep.kind), dep)
+                    .is_some()
+                {
+                    return Err(anyhow!(
+                        "Duplicate dependency crate name {} in package {}",
+                        dep.name,
+                        pkg.id
+                    ));
+                }
+            }
+            // Now that we can lookup information about a dependency from the crate name,
+            // build a ResolvedDependency that contains all the information needed to generate
+            // the corresponding nix expression
+            let deps: Vec<ResolvedDependency> = package_resolve_node
+                .deps
+                .iter()
+                .flat_map(|node_dep| {
+                    node_dep.dep_kinds.iter().map(|dep_kind| {
+                        let dep = *dependencies_by_crate_name_and_kind
+                            .get(&(node_dep.name.as_str(), dep_kind.kind))
+                            .ok_or_else(|| anyhow!("Lost dependency"))?;
+                        Ok(ResolvedDependency {
+                            dependency_name: dep.rename.as_deref().unwrap_or(&dep.name),
+                            crate_name: &node_dep.name,
+                            pkg: get_package(&node_dep.pkg)?,
+                            optionality: if dep.optional {
+                                Optionality::Optional {
+                                    activated_by_local_features: Default::default(),
+                                    activated_by_features: Default::default(),
+                                }
+                            } else {
+                                Optionality::Required
+                            },
+                            dep_kind,
+                        })
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut optional_deps_by_name: HashMap<&str, Vec<&mut ResolvedDependency>> =
+                HashMap::new();
+            for rd in &mut deps {
+                if let Optionality::Optional { .. } = rd.optionality {
+                    optional_deps_by_name
+                        .entry(rd.crate_name)
+                        .or_default()
+                        .push(rd);
+                }
+            }
+            let features = pkg
+                .features
+                .keys()
+                .map(|feature_name| ResolvedFeature {
+                    name: feature_name,
+                    optionality: Optionality::Optional {
+                        activated_by_local_features: Default::default(),
+                        activated_by_features: Default::default(),
+                    },
+                })
+                .collect();
+            for (feature, activates_features) in &pkg.features {}
             Ok(ResolvedPackage {
                 pkg,
-                deps: package_resolve_node
-                    .deps
-                    .iter()
-                    .zip(&pkg.dependencies)
-                    .flat_map(|(node_dep, dep)| {
-                        if dep.name.chars().all(|c| c.is_ascii_lowercase()) {
-                            anyhow::ensure!(
-                                node_dep.name == dep.name,
-                                "We have no way to match deps with dep nodes for external name on {}",
-                                pkg.id
-                            );
-                        }
-                        let dep_pkg = get_package(&node_dep.pkg)?;
-                        Ok(node_dep.dep_kinds.iter().map(|dep_kind|ResolvedDependency{
-                            extern_name: &dep.name,
-                            pkg: dep_pkg,
-                            optionality: Optionality::Required, /* TODO */
-                            dep_kind,
-                        }))
-                    })
-                    .collect(),
-                features: todo!(),
+                deps,
+                features,
                 checksum: todo!(),
             })
         })
@@ -548,9 +604,9 @@ fn mark_feature_activations<'a>(
 
 #[derive(Debug)]
 pub struct ResolvedPackage<'a> {
-    pkg: &'a Package,
-    deps: BTreeMap<(PackageId, DepKind), ResolvedDependency<'a>>,
-    features: BTreeMap<Feature<'a>, Optionality<'a>>,
+    pkg: &'a cargo_metadata::Package,
+    deps: Vec<ResolvedDependency<'a>>,
+    features: Vec<ResolvedFeature<'a>>,
     checksum: Option<&'a str>,
 }
 
@@ -585,7 +641,7 @@ impl<'a> ResolvedPackage<'a> {
                 let rdep = deps
                     .entry((dep_id, dep.kind()))
                     .or_insert(ResolvedDependency {
-                        extern_name,
+                        crate_name: extern_name,
                         pkg: dep_pkg,
                         optionality: Optionality::default(),
                         platforms: Some(BTreeSet::new()),
@@ -631,16 +687,24 @@ impl<'a> ResolvedPackage<'a> {
 
 #[derive(Debug)]
 struct ResolvedDependency<'a> {
-    extern_name: &'a str,
+    dependency_name: &'a str,
+    crate_name: &'a str,
     pkg: &'a cargo_metadata::Package,
     optionality: Optionality<'a>,
     dep_kind: &'a cargo_metadata::DepKindInfo,
+}
+
+#[derive(Debug)]
+struct ResolvedFeature<'a> {
+    name: &'a str,
+    optionality: Optionality<'a>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 enum Optionality<'a> {
     Required,
     Optional {
+        activated_by_local_features: HashSet<&'a str>,
         activated_by_features: HashSet<RootFeature<'a>>,
     },
 }

@@ -1,12 +1,17 @@
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{anyhow, Result};
-use cargo::core::{dependency::DepKind, source::GitReference, Package, PackageId, SourceId};
-use serde::Serialize;
+use {
+    anyhow::{anyhow, Result},
+    cargo::core::{dependency::DepKind, source::GitReference, Package, PackageId, SourceId},
+    serde::Serialize,
+};
 
-use crate::manifest::TomlProfile;
-use crate::{platform, BoolExpr, Feature as FeatureStr, Optionality, ResolvedPackage};
+use crate::{
+    manifest::TomlProfile, platform, BoolExpr, Feature as FeatureStr, Optionality, ResolvedPackage,
+};
 
 #[derive(Debug, Serialize)]
 pub struct BuildPlan {
@@ -236,7 +241,7 @@ fn to_dependencies(
 
         let dep = Dependency {
             name: pkg_id.name().to_string(),
-            extern_name: dep.extern_name.to_string(),
+            extern_name: dep.crate_name.to_string(),
             version: pkg_id.version().to_string(),
             registry: to_registry_string(pkg_id.source_id()),
             cfg_condition,
